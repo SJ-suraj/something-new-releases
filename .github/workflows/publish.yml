@@ -1,0 +1,58 @@
+name: publish
+# Worker for the private repo SJ-suraj/something-new (whose own Actions are blocked by account
+# billing; public-repo Actions are free). Every 30 min: clone the private repo over a deploy key,
+# process every posts/*/job.json that has no run.md yet (render + gate + release here + Buffer),
+# push run.md/state/stats back. Secrets: PRIVATE_DEPLOY_KEY (write key on something-new),
+# BUFFER_ACCESS_TOKEN, BUFFER_CHANNEL_ID, BUFFER_ORGANIZATION_ID.
+on:
+  schedule: [{ cron: "5,35 * * * *" }]
+  workflow_dispatch:
+    inputs:
+      folder: { description: "posts/<folder> to (re)process even if run.md exists", required: false }
+concurrency: { group: publish, cancel-in-progress: false }
+permissions: { contents: write }
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GIT_SSH_COMMAND: ssh -i /home/runner/.ssh/private -o IdentitiesOnly=yes
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+      - name: private checkout
+        run: |
+          mkdir -p ~/.ssh && printf '%s\n' "${{ secrets.PRIVATE_DEPLOY_KEY }}" > ~/.ssh/private && chmod 600 ~/.ssh/private
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone -q --depth 1 git@github.com:SJ-suraj/something-new.git work
+      - name: pending jobs
+        id: pending
+        env: { FORCE: "${{ inputs.folder }}" }
+        run: |
+          cd work
+          if [ -n "$FORCE" ]; then case "$FORCE" in posts/[A-Za-z0-9_-]*) echo "$FORCE" > ../pending;; *) echo "bad folder"; exit 1;; esac
+          else for j in $(ls posts/*/job.json 2>/dev/null | sort); do d=$(dirname "$j"); [ -f "$d/run.md" ] || echo "$d" >> ../pending; done; fi
+          touch ../pending; echo "n=$(wc -l < ../pending | tr -d ' ')" >> "$GITHUB_OUTPUT"; cat ../pending
+      - uses: actions/setup-node@v4
+        if: steps.pending.outputs.n != '0'
+        with: { node-version: 22 }
+      - name: tools
+        if: steps.pending.outputs.n != '0'
+        run: cd work/tools && npm ci && npx playwright install --with-deps chromium && pip install --quiet pillow
+      - name: process
+        if: steps.pending.outputs.n != '0'
+        env:
+          BUFFER_ACCESS_TOKEN: ${{ secrets.BUFFER_ACCESS_TOKEN }}
+          BUFFER_CHANNEL_ID: ${{ secrets.BUFFER_CHANNEL_ID }}
+          BUFFER_ORGANIZATION_ID: ${{ secrets.BUFFER_ORGANIZATION_ID }}
+          RELEASES_DIR: ${{ github.workspace }}
+        run: |
+          cd work; rc=0
+          git config user.name something-new-publish && git config user.email something-new-publish@users.noreply.github.com
+          while read -r f; do [ -n "$f" ] || continue
+            bash tools/publish_job.sh "$f" || rc=1
+            git add "$f/run.md" "$f/gate.json" "$f/sheet.jpg" state/done.json stats 2>/dev/null || true
+            git diff --cached --quiet || git commit -qm "run: $(basename "$f")"
+          done < ../pending
+          # results go back to the private repo (worker commits only: run.md, gate.json, sheet.jpg, state, stats)
+          for try in 1 2 3 4 5; do git pull -q --rebase origin main && git push -q origin HEAD:main && break; sleep 5; done
+          exit $rc
