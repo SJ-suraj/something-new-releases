@@ -54,5 +54,7 @@ jobs:
             git diff --cached --quiet || git commit -qm "run: $(basename "$f")"
           done < ../pending
           # results go back to the private repo (worker commits only: run.md, gate.json, sheet.jpg, state, stats)
-          for try in 1 2 3 4 5; do git pull -q --rebase origin main && git push -q origin HEAD:main && break; sleep 5; done
+          git status --short
+          pushed=0; for try in 1 2 3 4 5; do git pull -q --rebase --autostash origin main && git push -q origin HEAD:main && pushed=1 && break; sleep 5; done
+          [ $pushed = 1 ] || { echo "could not push results to the private repo"; exit 1; }
           exit $rc
